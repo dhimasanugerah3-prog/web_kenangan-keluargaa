@@ -1,0 +1,139 @@
+require('dotenv').config();
+const express = require('express');
+const session = require('express-session');
+const cors = require('cors');
+const helmet = require('helmet');
+const compression = require('compression');
+const morgan = require('morgan');
+const multer = require('multer');
+const path = require('path');
+const bcrypt = require('bcryptjs');
+const { body, validationResult } = require('express-validator');
+
+const db = require('./config/database');
+const { isAuth, apiLimiter } = require('./middleware/auth');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Security & Optimization Middleware
+app.use(helmet({ contentSecurityPolicy: false })); // CSP false dimatikan agar asset CDN eksternal lancar dimuat
+app.use(cors());
+app.use(compression());
+app.use(morgan('dev'));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Session Configuration (Auto-logout idle 15 menit)
+app.use(session({
+    secret: process.env.SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: { maxAge: 15 * 60 * 1000, secure: false, httpOnly: true } 
+}));
+
+// Multer Storage Configuration
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, 'uploads/'),
+    filename: (req, file, cb) => cb(null, Date.now() + path.extname(file.originalname))
+});
+const upload = multer({
+    storage: storage,
+    limits: { fileSize: 50 * 1024 * 1024 }, // Max 50MB
+    fileFilter: (req, file, cb) => {
+        const filetypes = /jpeg|jpg|png|gif|mp4|mov|avi/;
+        const extname = filetypes.test(path.extname(file.originalname).toLowerCase());
+        const mimetype = filetypes.test(file.mimetype);
+        if (extname && mimetype) return cb(null, true);
+        cb(new Error('Format file tidak didukung!'));
+    }
+});
+
+// --- API ROUTES ---
+
+// 1. LOGIN ENDPOINT
+app.post('/api/auth/login', apiLimiter, [
+    body('nickname').trim().escape(),
+    body('phone').trim().escape()
+], (req, res) => {
+    const { nickname, phone, password } = req.body;
+    
+    db.get("SELECT * FROM users WHERE nickname = ?", [nickname], async (err, user) => {
+        if (!user) return res.status(404).json({ message: "Maaf, akun tidak terdaftar." });
+        
+        const validPassword = await bcrypt.compare(password, user.password);
+        if (!validPassword) return res.status(401).json({ message: "Password salah." });
+        
+        // Simulasi OTP
+        const generatedOTP = "123456"; // Untuk kebutuhan produksi silakan ganti menjadi acak Math.floor(100000 + Math.random() * 900000)
+        req.session.tempUserId = user.id;
+        req.session.tempOTP = generatedOTP;
+
+        console.log(`[OTP SIMULATION] Kode OTP untuk ${user.nickname}: ${generatedOTP}`);
+        return res.json({ status: "OTP_SENT", message: "Kode OTP telah dikirimkan (Cek Log Konsol Server)." });
+    });
+});
+
+// 2. VERIFY OTP ENDPOINT
+app.post('/api/auth/verify-otp', (req, res) => {
+    const { otp } = req.body;
+    if (otp === req.session.tempOTP) {
+        req.session.userId = req.session.tempUserId;
+        req.session.otpVerified = true;
+        
+        // Catat riwayat login
+        db.run("INSERT INTO activity_logs (user_id, activity) VALUES (?, 'Login ke sistem')", [req.session.userId]);
+        
+        return res.json({ status: "SUCCESS", message: "Login Berhasil" });
+    }
+    return res.status(400).json({ message: "Kode OTP tidak valid." });
+});
+
+// 3. DASHBOARD & STATS ENDPOINT
+app.get('/api/dashboard', isAuth, (req, res) => {
+    db.get("SELECT nickname, avatar FROM users WHERE id = ?", [req.session.userId], (err, user) => {
+        db.all(`SELECT 
+            COUNT(CASE WHEN file_type LIKE 'image%' AND is_deleted=0 THEN 1 END) as photos,
+            COUNT(CASE WHEN file_type LIKE 'video%' AND is_deleted=0 THEN 1 END) as videos,
+            SUM(size) as total_size FROM gallery WHERE user_id = ?`, [req.session.userId], (err, stats) => {
+                db.all("SELECT activity, created_at FROM activity_logs WHERE user_id = ? ORDER BY id DESC LIMIT 5", [req.session.userId], (err, logs) => {
+                    res.json({ user, stats: stats[0], logs });
+                });
+        });
+    });
+});
+
+// 4. FILE UPLOAD ENDPOINT
+app.post('/api/upload', isAuth, upload.array('files'), (req, res) => {
+    const { album, location, tags, description } = req.body;
+    const stmt = db.prepare(`INSERT INTO gallery 
+        (user_id, title, description, filename, file_type, size, album, location, tags) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+
+    req.files.forEach(file => {
+        stmt.run(req.session.userId, file.originalname, description || '', file.filename, file.mimetype, file.size, album || 'Dokumentasi', location || '', tags || '');
+    });
+    stmt.finalize();
+
+    db.run("INSERT INTO activity_logs (user_id, activity) VALUES (?, ?)", [req.session.userId, `Mengupload ${req.files.length} file`]);
+    res.json({ message: "Upload berhasil." });
+});
+
+// 5. GET GALLERY ENDPOINT
+app.get('/api/gallery', isAuth, (req, res) => {
+    db.all("SELECT * FROM gallery WHERE user_id = ? AND is_deleted = 0 ORDER BY id DESC", [req.session.userId], (err, rows) => {
+        res.json(rows);
+    });
+});
+
+// 6. LOGOUT
+app.post('/api/auth/logout', (req, res) => {
+    req.session.destroy();
+    res.json({ message: "Logout berhasil" });
+});
+
+// Serve Static Assets & Frontend Engine
+app.use(express.static(path.join(__dirname, 'public')));
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+app.listen(PORT, () => console.log(`Server berjalan di http://localhost:${PORT}`));

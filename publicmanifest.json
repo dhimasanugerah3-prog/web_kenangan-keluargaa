@@ -1,0 +1,15 @@
+{
+  "name": "Digital Family Gallery",
+  "short_name": "FamilyGallery",
+  "start_url": "/index.html",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#4f46e5",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/3359/3359223.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
